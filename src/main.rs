@@ -1,13 +1,18 @@
-use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::process::Command;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 const SWID: u8 = 0x0a;
 const CHANGE_HOST: u16 = 0x1814;
-const KIND_KEYBOARD: u8 = 1;
-const KIND_MOUSE: u8 = 2;
+
+// AORUS FI32U, found by serial so it survives i2c bus renumbering and works on any host
+const MONITOR_SN: &str = "23430B003207";
+const INPUT_DP: u8 = 0x0f;
+const INPUT_USB_C: u8 = 0x10;
+const POLL: Duration = Duration::from_secs(1);
 
 fn receivers() -> Vec<String> {
     let mut paths = Vec::new();
@@ -69,21 +74,22 @@ fn run(path: &str, host: Option<u8>) -> std::io::Result<()> {
                 if fi == 0 {
                     continue;
                 }
+                f.write_all(&[0x10, dev, fi, SWID, 0, 0, 0])?;
+                pending |= 1 << dev;
+            }
+            // Checked before the host info arm: a feature index can equal SWID
+            (0x8f | 0xff, _, _) => pending &= !(1 << dev),
+            (fi, SWID, count) => {
+                pending &= !(1 << dev);
+                let current = r[5] + 1;
                 match host {
-                    Some(h) => {
+                    // Setting the current host again would needlessly drop the link
+                    Some(h) if h != current => {
                         f.write_all(&[0x10, dev, fi, 0x10 | SWID, h - 1, 0, 0])?;
                         println!("{path} device {dev}: host {h}");
                     }
-                    None => {
-                        f.write_all(&[0x10, dev, fi, SWID, 0, 0, 0])?;
-                        pending |= 1 << dev;
-                    }
+                    _ => println!("{path} device {dev}: host {current} of {count}"),
                 }
-            }
-            (0xff, _, _) => pending &= !(1 << dev),
-            (_, SWID, _) => {
-                pending &= !(1 << dev);
-                println!("{path} device {dev}: host {} of {}", r[5] + 1, r[4]);
             }
             _ => {}
         }
@@ -91,107 +97,72 @@ fn run(path: &str, host: Option<u8>) -> std::io::Result<()> {
     Ok(())
 }
 
-// Read one report, serving notifications set aside by `request` first
-fn next_report(f: &mut File, queue: &mut VecDeque<Vec<u8>>) -> std::io::Result<Vec<u8>> {
-    if let Some(r) = queue.pop_front() {
-        return Ok(r);
-    }
-    let mut buf = [0u8; 64];
-    let n = f.read(&mut buf)?;
-    Ok(buf[..n].to_vec())
-}
-
-// Send an HID++ 2.0 request and wait for its response; other reports are queued
-fn request(f: &mut File, queue: &mut VecDeque<Vec<u8>>, dev: u8, fi: u8, func: u8, params: &[u8]) -> Option<Vec<u8>> {
-    let mut msg = [0x10, dev, fi, func << 4 | SWID, 0, 0, 0];
-    msg[4..4 + params.len()].copy_from_slice(params);
-    f.write_all(&msg).ok()?;
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut buf = [0u8; 64];
-    while let Some(n) = read_until(f, &mut buf, deadline) {
-        let r = &buf[..n];
-        if n >= 7 && matches!(r[0], 0x10 | 0x11) && r[1] == dev {
-            if r[2] == fi && r[3] == msg[3] {
-                return Some(r[4..].to_vec());
-            }
-            if matches!(r[2], 0x8f | 0xff) && r[3] == fi && r[4] == msg[3] {
-                return None;
-            }
+// Selecting the monitor by serial makes ddcutil probe every bus (~7 s), so look up its bus once
+fn monitor_bus() -> Option<String> {
+    let output = Command::new("ddcutil").args(["detect", "--terse"]).output().ok()?;
+    let mut bus = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if let Some(path) = line.strip_prefix("I2C bus:") {
+            bus = path.trim().strip_prefix("/dev/i2c-").map(str::to_owned);
+        } else if line.starts_with("Monitor:") && line.ends_with(&format!(":{MONITOR_SN}")) {
+            return bus;
         }
-        queue.push_back(r.to_vec());
     }
     None
 }
 
-fn change_host_index(f: &mut File, queue: &mut VecDeque<Vec<u8>>, dev: u8) -> Option<u8> {
-    let fi = request(f, queue, dev, 0x00, 0, &CHANGE_HOST.to_be_bytes())?[0];
-    (fi != 0).then_some(fi)
-}
-
-fn move_mouse(f: &mut File, queue: &mut VecDeque<Vec<u8>>, dev: u8, host: u8) {
-    let fi = change_host_index(f, queue, dev);
-    let current = fi.and_then(|fi| request(f, queue, dev, fi, 0, &[])).map(|info| info[1] + 1);
-    match fi {
-        Some(_) if current == Some(host) => {}
-        Some(fi) => {
-            // The mouse drops the link immediately, so there is no response to wait for
-            let _ = f.write_all(&[0x10, dev, fi, 0x10 | SWID, host - 1, 0, 0]);
-            println!("mouse: host {host}");
-        }
-        None => println!("mouse: not connected"),
+fn monitor_input(bus: &mut Option<String>) -> Option<u8> {
+    let get = |bus: &str| {
+        let output = Command::new("ddcutil").args(["--bus", bus, "-t", "getvcp", "60"]).output().ok()?;
+        // Terse output: "VCP 60 SNC x0f"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        u8::from_str_radix(stdout.split_whitespace().last()?.strip_prefix('x')?, 16).ok()
+    };
+    if let Some(input) = bus.as_deref().and_then(get) {
+        return Some(input);
     }
+    // The bus may have been renumbered (monitor replugged, reboot): look it up again
+    *bus = monitor_bus();
+    bus.as_deref().and_then(get)
 }
 
-fn watch(path: &str) -> std::io::Result<()> {
-    let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut queue = VecDeque::new();
-    // Ask the receiver to announce every paired device, which gives the initial state
-    f.write_all(&[0x10, 0xff, 0x80, 0x02, 0x02, 0, 0])?;
-    let mut mouse = None;
+// The monitor input is the shared state between hosts: move the devices wherever it points
+fn watch() -> ! {
+    let mut bus = monitor_bus();
     let mut last = None;
     loop {
-        let r = next_report(&mut f, &mut queue)?;
-        // HID++ 1.0 device connection notification: kind in the low nibble, bit 6 set when the link is down
-        if r.len() < 7 || r[0] != 0x10 || r[2] != 0x41 {
-            continue;
-        }
-        let (dev, kind, linked) = (r[1], r[4] & 0x0f, r[4] & 0x40 == 0);
-        match kind {
-            KIND_MOUSE => {
-                mouse = Some(dev);
-                // Catch up when the mouse is announced after the keyboard is already handled here
-                if let Some(host @ (1 | 3)) = last
-                    && linked
-                {
-                    move_mouse(&mut f, &mut queue, dev, host);
-                }
-            }
-            KIND_KEYBOARD => {
-                let host = if linked {
-                    let Some(fi) = change_host_index(&mut f, &mut queue, dev) else { continue };
-                    let Some(info) = request(&mut f, &mut queue, dev, fi, 0, &[]) else { continue };
-                    info[1] + 1
-                } else {
-                    // The receiver only knows whether the keyboard is here; assume it left for host 2
-                    2
-                };
-                if last != Some(host) {
-                    println!("keyboard: host {host}");
-                    if let Some(dev) = mouse {
-                        move_mouse(&mut f, &mut queue, dev, host);
+        if let Some(input) = monitor_input(&mut bus) {
+            let host = match input {
+                INPUT_DP => Some(1),
+                INPUT_USB_C => Some(2),
+                _ => None,
+            };
+            // Only act on changes, so that switching devices by hand is left alone; the first reading
+            // counts as one since the input may have changed during the slow bus lookup
+            if last != Some(input)
+                && let Some(h) = host
+            {
+                println!("monitor: input {input:#04x}, devices to host {h}");
+                for path in receivers() {
+                    if let Err(e) = run(&path, Some(h)) {
+                        eprintln!("{path}: {e}");
                     }
-                    last = Some(host);
                 }
             }
-            _ => {}
+            last = Some(input);
         }
+        sleep(POLL);
     }
 }
 
 fn main() {
     let arg = std::env::args().nth(1);
-    let host = match arg.as_deref() {
-        None | Some("watch") => None,
+    if arg.as_deref() == Some("watch") {
+        watch();
+    }
+    let host = match arg {
+        None => None,
         Some(a) => match a.parse::<u8>() {
             Ok(h @ 1..=3) => Some(h),
             _ => {
@@ -204,18 +175,6 @@ fn main() {
     if paths.is_empty() {
         eprintln!("no Logitech receiver found");
         std::process::exit(1);
-    }
-    if arg.as_deref() == Some("watch") {
-        std::thread::scope(|s| {
-            for path in &paths {
-                s.spawn(move || {
-                    if let Err(e) = watch(path) {
-                        eprintln!("{path}: {e}");
-                    }
-                });
-            }
-        });
-        return;
     }
     for path in paths {
         if let Err(e) = run(&path, host) {
