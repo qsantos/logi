@@ -1,0 +1,10 @@
+[Unit]
+Description=Move Logi devices to the host shown by the monitor
+
+[Service]
+ExecStart=%h/.local/bin/logi watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
