@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::thread::sleep;
 use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -19,6 +20,9 @@ const DDC_PEER: u8 = (DDC_ADDR as u8) << 1;
 // The host answers to 0x50; requests carry it with the low bit set to mark them as a source address
 const DDC_HOST: u8 = 0x50;
 const VCP_INPUT: u8 = 0x60;
+const DDC_REPLY_DELAY: Duration = Duration::from_millis(40);
+const DDC_ATTEMPTS: u8 = 4;
+const DDC_RETRY: Duration = Duration::from_millis(60);
 const I2C_RDWR: libc::c_ulong = 0x0707;
 const I2C_M_RD: u16 = 0x0001;
 
@@ -206,19 +210,23 @@ fn checksum(seed: u8, bytes: &[u8]) -> u8 {
     bytes.iter().fold(seed, |sum, b| sum ^ b)
 }
 
-// One DDC/CI exchange, ~45 ms. The spec asks for a 40 ms pause before reading the reply, but this
-// adapter spends a flat ~21 ms in the driver per transfer (1 byte and 128 bytes both cost that much,
-// the bus itself running at ~27 us/byte), so the monitor has had its preparation time by the time the
-// read is issued, and an explicit sleep only adds latency. ddcutil would do the same in 240 ms, re-reading the EDID every call,
-// and its retry backoff blocks for seconds when the monitor is mid-switch, which is exactly when the
-// answer matters. The checks below matter because a concurrent reader on the bus (another ddcutil,
-// say) is answered from the same queue, so a reply meant for someone else can land here.
-fn read_vcp(dev: &File, code: u8) -> Option<u8> {
+// One DDC/CI exchange. The spec asks for a 40 ms pause before reading the reply, and adapters differ
+// wildly in how much of that they spend on their own: this NVIDIA one sits a flat ~21 ms in the driver
+// per transfer (1 byte and 128 bytes cost the same, the bus itself running at ~27 us/byte), while a
+// normal adapter is done in ~1 ms and leaves the monitor no time to prepare. So wait out the remainder,
+// which is free on a slow adapter and correct on a fast one.
+// The reply is checked closely because a concurrent reader is answered from the same queue, so a reply
+// meant for someone else, or one read before the monitor was ready, can land here.
+fn read_vcp_once(dev: &File, code: u8) -> Option<u8> {
     let _lock = BusLock::new(dev);
     let mut req = [DDC_HOST | 1, 0x82, 0x01, code, 0];
     req[4] = checksum(DDC_PEER, &req[..4]);
+    let sent = Instant::now();
     if !i2c_xfer(dev, 0, &mut req) {
         return None;
+    }
+    if let Some(left) = DDC_REPLY_DELAY.checked_sub(sent.elapsed()) {
+        sleep(left);
     }
     // Source, length, "VCP reply", result, code, type, max hi, max lo, value hi, value lo, checksum
     let mut rep = [0u8; 11];
@@ -232,6 +240,17 @@ fn read_vcp(dev: &File, code: u8) -> Option<u8> {
         && rep[4] == code
         && checksum(DDC_HOST, &rep[..10]) == rep[10];
     sane.then(|| rep[9])
+}
+
+// Around one read in ten comes back empty or garbled even on an idle bus, so never decide anything on
+// a single one
+fn read_vcp(dev: &File, code: u8) -> Option<u8> {
+    (0..DDC_ATTEMPTS).find_map(|attempt| {
+        if attempt > 0 {
+            sleep(DDC_RETRY);
+        }
+        read_vcp_once(dev, code)
+    })
 }
 
 fn write_vcp(dev: &File, code: u8, value: u16) -> bool {
@@ -253,14 +272,20 @@ fn switch(host: Option<u8>) {
     let host = match host {
         Some(h) => h,
         // Without an argument, move to whichever host is not on screen now
-        None => match read_vcp(&dev, VCP_INPUT).and_then(host_for_input) {
-            Some(1) => 2,
-            Some(_) => 1,
-            None => {
-                eprintln!("monitor is on an input we do not manage");
+        None => {
+            let Some(input) = read_vcp(&dev, VCP_INPUT) else {
+                eprintln!("no answer from the monitor");
                 std::process::exit(1);
+            };
+            match host_for_input(input) {
+                Some(1) => 2,
+                Some(_) => 1,
+                None => {
+                    eprintln!("monitor is on input {input:#04x}, which maps to no host");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
     };
     let Some(input) = input_for_host(host) else {
         eprintln!("no monitor input known for host {host}");
