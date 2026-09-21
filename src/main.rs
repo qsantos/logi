@@ -12,8 +12,22 @@ const CHANGE_HOST: u16 = 0x1814;
 const MONITOR_SN: &str = "23430B003207";
 const INPUT_DP: u8 = 0x0f;
 const INPUT_USB_C: u8 = 0x10;
-const POLL: Duration = Duration::from_secs(1);
+const POLL: Duration = Duration::from_millis(500);
+// A silent monitor is nearly always one that is switching inputs, and it is worth catching the new
+// input the moment it answers, so poll hard until it does
+const RETRY: Duration = Duration::from_millis(100);
 const RELOOKUP_AFTER: Duration = Duration::from_secs(10);
+
+// DDC/CI: the monitor listens at 0x37, requests carry the host address 0x51, and checksums are
+// seeded with the address the bytes travel to
+const DDC_ADDR: u16 = 0x37;
+const DDC_PEER: u8 = (DDC_ADDR as u8) << 1;
+// The host answers to 0x50; requests carry it with the low bit set to mark them as a source address
+const DDC_HOST: u8 = 0x50;
+const DDC_REPLY_DELAY: Duration = Duration::from_millis(40);
+const VCP_INPUT: u8 = 0x60;
+const I2C_RDWR: libc::c_ulong = 0x0707;
+const I2C_M_RD: u16 = 0x0001;
 
 fn receivers() -> Vec<String> {
     let mut paths = Vec::new();
@@ -99,6 +113,10 @@ fn run(path: &str, host: Option<u8>) -> std::io::Result<()> {
 }
 
 // Selecting the monitor by serial makes ddcutil probe every bus (~7 s), so look up its bus once
+fn open_bus(bus: Option<String>) -> Option<File> {
+    OpenOptions::new().read(true).write(true).open(format!("/dev/i2c-{}", bus?)).ok()
+}
+
 fn monitor_bus() -> Option<String> {
     let output = Command::new("ddcutil").args(["detect", "--terse"]).output().ok()?;
     let mut bus = None;
@@ -113,28 +131,97 @@ fn monitor_bus() -> Option<String> {
     None
 }
 
-fn read_input(bus: &str) -> Option<u8> {
-    let output = Command::new("ddcutil").args(["--bus", bus, "-t", "getvcp", "60"]).output().ok()?;
-    // Terse output: "VCP 60 SNC x0f"
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    u8::from_str_radix(stdout.split_whitespace().last()?.strip_prefix('x')?, 16).ok()
+#[repr(C)]
+struct I2cMsg {
+    addr: u16,
+    flags: u16,
+    len: u16,
+    buf: *mut u8,
+}
+
+#[repr(C)]
+struct I2cRdwr {
+    msgs: *mut I2cMsg,
+    nmsgs: u32,
+}
+
+fn i2c_xfer(dev: &File, flags: u16, buf: &mut [u8]) -> bool {
+    let mut msg = I2cMsg { addr: DDC_ADDR, flags, len: buf.len() as u16, buf: buf.as_mut_ptr() };
+    let mut data = I2cRdwr { msgs: &mut msg, nmsgs: 1 };
+    // SAFETY: the ioctl transfers one message, describing a buffer that outlives the call
+    let rc = unsafe { libc::ioctl(dev.as_raw_fd(), I2C_RDWR, &mut data) };
+    rc >= 0
+}
+
+// The monitor keeps one reply buffer per bus, so a concurrent reader is answered from the same queue
+// and can walk off with our reply. ddcutil locks the device with flock for this reason; take the same
+// lock so the two cooperate without needing a channel of their own.
+struct BusLock<'a>(&'a File);
+
+impl<'a> BusLock<'a> {
+    fn new(dev: &'a File) -> Self {
+        unsafe { libc::flock(dev.as_raw_fd(), libc::LOCK_EX) };
+        BusLock(dev)
+    }
+}
+
+impl Drop for BusLock<'_> {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn checksum(seed: u8, bytes: &[u8]) -> u8 {
+    bytes.iter().fold(seed, |sum, b| sum ^ b)
+}
+
+// One DDC/CI exchange, ~85 ms. ddcutil would do the same in 240 ms, re-reading the EDID every call,
+// and its retry backoff blocks for seconds when the monitor is mid-switch, which is exactly when the
+// answer matters. The checks below matter because a concurrent reader on the bus (another ddcutil,
+// say) is answered from the same queue, so a reply meant for someone else can land here.
+fn read_vcp(dev: &File, code: u8) -> Option<u8> {
+    let _lock = BusLock::new(dev);
+    let mut req = [DDC_HOST | 1, 0x82, 0x01, code, 0];
+    req[4] = checksum(DDC_PEER, &req[..4]);
+    if !i2c_xfer(dev, 0, &mut req) {
+        return None;
+    }
+    // The monitor needs time to prepare the reply; the spec asks for at least 40 ms
+    sleep(DDC_REPLY_DELAY);
+    // Source, length, "VCP reply", result, code, type, max hi, max lo, value hi, value lo, checksum
+    let mut rep = [0u8; 11];
+    if !i2c_xfer(dev, I2C_M_RD, &mut rep) {
+        return None;
+    }
+    let sane = rep[0] == DDC_PEER
+        && rep[1] == 0x88
+        && rep[2] == 0x02
+        && rep[3] == 0x00
+        && rep[4] == code
+        && checksum(DDC_HOST, &rep[..10]) == rep[10];
+    sane.then(|| rep[9])
 }
 
 struct Monitor {
-    bus: Option<String>,
+    dev: Option<File>,
     failing_since: Option<Instant>,
 }
 
 impl Monitor {
     fn new() -> Self {
-        Monitor { bus: monitor_bus(), failing_since: None }
+        Monitor { dev: open_bus(monitor_bus()), failing_since: None }
+    }
+
+    // Silent monitors are usually mid-switch, so the caller polls harder until one answers
+    fn silent(&self) -> bool {
+        self.failing_since.is_some()
     }
 
     // A read fails whenever the monitor is busy switching inputs, which is the common case and clears
     // up in a couple of seconds, while the bus number only moves if the GPU driver rebinds. So keep
     // reading the bus we know and let a long outage, or a failed lookup at startup, pay for a probe.
     fn input(&mut self) -> Option<u8> {
-        if let Some(input) = self.bus.as_deref().and_then(read_input) {
+        if let Some(input) = self.dev.as_ref().and_then(|dev| read_vcp(dev, VCP_INPUT)) {
             self.failing_since = None;
             return Some(input);
         }
@@ -144,8 +231,8 @@ impl Monitor {
         }
         // Restart the countdown either way: a probe costs 7 s and the monitor may simply be off
         self.failing_since = Some(Instant::now());
-        self.bus = monitor_bus();
-        let input = self.bus.as_deref().and_then(read_input);
+        self.dev = open_bus(monitor_bus());
+        let input = self.dev.as_ref().and_then(|dev| read_vcp(dev, VCP_INPUT));
         if input.is_some() {
             self.failing_since = None;
         }
@@ -178,7 +265,7 @@ fn watch() -> ! {
             }
             last = Some(input);
         }
-        sleep(POLL);
+        sleep(if monitor.silent() { RETRY } else { POLL });
     }
 }
 
@@ -186,6 +273,15 @@ fn main() {
     let arg = std::env::args().nth(1);
     if arg.as_deref() == Some("watch") {
         watch();
+    }
+    if arg.as_deref() == Some("input") {
+        // An explicit bus skips the slow lookup, which is handy when testing
+        let mut monitor = match std::env::args().nth(2) {
+            Some(bus) => Monitor { dev: open_bus(Some(bus)), failing_since: None },
+            None => Monitor::new(),
+        };
+        println!("{:?}", monitor.input().map(|i| format!("{i:#04x}")));
+        return;
     }
     let host = match arg {
         None => None,
