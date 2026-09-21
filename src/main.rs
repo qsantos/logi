@@ -13,6 +13,7 @@ const MONITOR_SN: &str = "23430B003207";
 const INPUT_DP: u8 = 0x0f;
 const INPUT_USB_C: u8 = 0x10;
 const POLL: Duration = Duration::from_secs(1);
+const RELOOKUP_AFTER: Duration = Duration::from_secs(10);
 
 fn receivers() -> Vec<String> {
     let mut paths = Vec::new();
@@ -112,27 +113,52 @@ fn monitor_bus() -> Option<String> {
     None
 }
 
-fn monitor_input(bus: &mut Option<String>) -> Option<u8> {
-    let get = |bus: &str| {
-        let output = Command::new("ddcutil").args(["--bus", bus, "-t", "getvcp", "60"]).output().ok()?;
-        // Terse output: "VCP 60 SNC x0f"
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        u8::from_str_radix(stdout.split_whitespace().last()?.strip_prefix('x')?, 16).ok()
-    };
-    if let Some(input) = bus.as_deref().and_then(get) {
-        return Some(input);
+fn read_input(bus: &str) -> Option<u8> {
+    let output = Command::new("ddcutil").args(["--bus", bus, "-t", "getvcp", "60"]).output().ok()?;
+    // Terse output: "VCP 60 SNC x0f"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    u8::from_str_radix(stdout.split_whitespace().last()?.strip_prefix('x')?, 16).ok()
+}
+
+struct Monitor {
+    bus: Option<String>,
+    failing_since: Option<Instant>,
+}
+
+impl Monitor {
+    fn new() -> Self {
+        Monitor { bus: monitor_bus(), failing_since: None }
     }
-    // The bus may have been renumbered (monitor replugged, reboot): look it up again
-    *bus = monitor_bus();
-    bus.as_deref().and_then(get)
+
+    // A read fails whenever the monitor is busy switching inputs, which is the common case and clears
+    // up in a couple of seconds, while the bus number only moves if the GPU driver rebinds. So keep
+    // reading the bus we know and let a long outage, or a failed lookup at startup, pay for a probe.
+    fn input(&mut self) -> Option<u8> {
+        if let Some(input) = self.bus.as_deref().and_then(read_input) {
+            self.failing_since = None;
+            return Some(input);
+        }
+        let failing_since = *self.failing_since.get_or_insert_with(Instant::now);
+        if failing_since.elapsed() < RELOOKUP_AFTER {
+            return None;
+        }
+        // Restart the countdown either way: a probe costs 7 s and the monitor may simply be off
+        self.failing_since = Some(Instant::now());
+        self.bus = monitor_bus();
+        let input = self.bus.as_deref().and_then(read_input);
+        if input.is_some() {
+            self.failing_since = None;
+        }
+        input
+    }
 }
 
 // The monitor input is the shared state between hosts: move the devices wherever it points
 fn watch() -> ! {
-    let mut bus = monitor_bus();
+    let mut monitor = Monitor::new();
     let mut last = None;
     loop {
-        if let Some(input) = monitor_input(&mut bus) {
+        if let Some(input) = monitor.input() {
             let host = match input {
                 INPUT_DP => Some(1),
                 INPUT_USB_C => Some(2),
